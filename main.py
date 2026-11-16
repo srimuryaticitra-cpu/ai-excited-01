@@ -1,338 +1,85 @@
-# KURA TERBANG! — The Tortoise That Launches Itself
-# ai-excited-01 entry: a deterministic program that paints one image.
-# Pure Python standard library only, no network, no randomness at run time.
-# Run:  python3 main.py        -> writes /output/entry.png (1024x1024, < 1 MiB)
-import os
-import struct
-import zlib
-
-W, H = 1024, 1024
-OUT = "/output/entry.png"
-
-
-# ---------------------------------------------------------------- deterministic rng
-class Rng:
-    def __init__(self, seed):
-        self.s = seed & 0xFFFFFFFF
-
-    def next(self):
-        self.s = (1664525 * self.s + 1013904223) & 0xFFFFFFFF
-        return self.s
-
-    def range(self, lo, hi):
-        return lo + self.next() % (hi - lo + 1)
-
-    def pick(self, items):
-        return items[self.next() % len(items)]
-
-
-# ---------------------------------------------------------------- canvas
-class Canvas:
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.px = bytearray(w * h * 3)
-
-    def set(self, x, y, c):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            self.px[i], self.px[i + 1], self.px[i + 2] = c
-
-    def blend(self, x, y, c, a):
-        # a in 0..255, draw colour c over what is already there
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            inv = 255 - a
-            self.px[i] = (c[0] * a + self.px[i] * inv) // 255
-            self.px[i + 1] = (c[1] * a + self.px[i + 1] * inv) // 255
-            self.px[i + 2] = (c[2] * a + self.px[i + 2] * inv) // 255
-
-    def hline(self, x0, x1, y, c):
-        if y < 0 or y >= self.h:
-            return
-        x0, x1 = max(0, x0), min(self.w - 1, x1)
-        for x in range(x0, x1 + 1):
-            self.set(x, y, c)
-
-    def vline(self, x, y0, y1, c):
-        if x < 0 or x >= self.w:
-            return
-        y0, y1 = max(0, y0), min(self.h - 1, y1)
-        for y in range(y0, y1 + 1):
-            self.set(x, y, c)
-
-    def line(self, x0, y0, x1, y1, c, thick=1):
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        while True:
-            for ox in range(-thick // 2, thick // 2 + 1):
-                for oy in range(-thick // 2, thick // 2 + 1):
-                    self.set(x0 + ox, y0 + oy, c)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
-
-    def circle(self, cx, cy, r, c):
-        for y in range(cy - r, cy + r + 1):
-            dx = int((r * r - (y - cy) * (y - cy)) ** 0.5) if abs(y - cy) <= r else 0
-            self.hline(cx - dx, cx + dx, y, c)
-
-    def ellipse(self, cx, cy, rx, ry, c):
-        for y in range(cy - ry, cy + ry + 1):
-            t = 1.0 - ((y - cy) / ry) ** 2
-            dx = int(rx * (t ** 0.5)) if t > 0 else 0
-            self.hline(cx - dx, cx + dx, y, c)
-
-    def poly(self, pts, c):
-        # scanline fill of a simple polygon
-        ys = [p[1] for p in pts]
-        for y in range(max(0, min(ys)), min(self.h - 1, max(ys)) + 1):
-            xs = []
-            n = len(pts)
-            for i in range(n):
-                x0, y0 = pts[i]
-                x1, y1 = pts[(i + 1) % n]
-                if (y0 <= y < y1) or (y1 <= y < y0):
-                    x = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
-                    xs.append(x)
-            xs.sort()
-            for i in range(0, len(xs) - 1, 2):
-                self.hline(int(xs[i]), int(xs[i + 1]), y, c)
-
-    def ring(self, cx, cy, r0, r1, c):
-        for y in range(cy - r1, cy + r1 + 1):
-            dy = y - cy
-            if abs(dy) > r1:
-                continue
-            dx1 = int((r1 * r1 - dy * dy) ** 0.5)
-            dx0 = int((r0 * r0 - dy * dy) ** 0.5) if abs(dy) <= r0 else 0
-            self.hline(cx - dx1, cx - dx0, y, c)
-            self.hline(cx + dx0, cx + dx1, y, c)
-
-
-def lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
-
-
-# ---------------------------------------------------------------- palette
-INDIGO = (26, 16, 66)
-PURPLE = (88, 32, 120)
-MAGENTA = (196, 52, 120)
-ORANGE = (255, 138, 61)
-GOLD = (255, 196, 66)
-CREAM = (255, 240, 205)
-SHELL = (46, 125, 50)
-SHELL_D = (27, 85, 34)
-SHELL_L = (104, 183, 84)
-SKIN = (232, 190, 120)
-SKIN_D = (198, 148, 82)
-RED = (214, 48, 49)
-WHITE = (255, 255, 255)
-BLACK = (20, 16, 24)
-FLAME_Y = (255, 214, 64)
-FLAME_O = (255, 122, 26)
-FLAME_R = (230, 57, 25)
-
-
-def draw(c):
-    rng = Rng(20261116)
-
-    # --- sky gradient: indigo top -> purple -> magenta -> orange horizon
-    stops = [(0.0, INDIGO), (0.38, PURPLE), (0.68, MAGENTA), (1.0, ORANGE)]
-    for y in range(H):
-        t = y / (H - 1)
-        for i in range(len(stops) - 1):
-            t0, c0 = stops[i]
-            t1, c1 = stops[i + 1]
-            if t0 <= t <= t1:
-                col = lerp(c0, c1, (t - t0) / (t1 - t0))
-                break
-        else:
-            col = ORANGE
-        c.hline(0, W - 1, y, col)
-
-    # --- stars in the upper sky
-    for _ in range(180):
-        x = rng.range(0, W - 1)
-        y = rng.range(0, 420)
-        s = rng.pick([1, 1, 1, 2])
-        a = rng.range(120, 255)
-        for ox in range(s):
-            for oy in range(s):
-                c.blend(x + ox, y + oy, WHITE, a)
-
-    # --- glowing portal ring behind the tortoise
-    cx, cy = 512, 500
-    for r, col, a in ((330, GOLD, 26), (300, GOLD, 40), (272, CREAM, 60)):
-        for k in range(360):
-            import math
-            ang = math.radians(k)
-            x = int(cx + r * math.cos(ang))
-            y = int(cy + r * math.sin(ang))
-            c.blend(x, y, col, a)
-            c.blend(x + 1, y, col, a)
-    c.ring(cx, cy, 258, 268, GOLD)
-
-    # --- distant hills
-    c.ellipse(180, 980, 420, 130, (58, 28, 84))
-    c.ellipse(860, 1000, 460, 140, (48, 22, 72))
-    c.ellipse(512, 1060, 700, 150, (38, 18, 60))
-
-    # --- launch pad smoke puffs at the bottom
-    for i in range(9):
-        px = 300 + i * 52 + rng.range(-14, 14)
-        py = 930 + rng.range(-18, 18)
-        pr = rng.range(26, 52)
-        c.circle(px, py, pr, (255, 226, 190))
-        c.circle(px - 8, py - 10, pr - 12, (255, 244, 224))
-
-    # --- rocket flame (layered teardrops, pointing down-left)
-    fx, fy = 380, 640
-    c.poly([(fx + 40, fy - 30), (fx - 60, fy + 150), (fx + 130, fy + 190),
-            (fx + 170, fy + 40)], FLAME_R)
-    c.poly([(fx + 55, fy - 20), (fx - 10, fy + 110), (fx + 115, fy + 140),
-            (fx + 145, fy + 30)], FLAME_O)
-    c.poly([(fx + 70, fy - 10), (fx + 35, fy + 70), (fx + 100, fy + 90),
-            (fx + 120, fy + 20)], FLAME_Y)
-    c.circle(fx + 78, fy + 30, 26, (255, 246, 200))
-    # sparks
-    for _ in range(40):
-        sx = fx + rng.range(-40, 180)
-        sy = fy + rng.range(60, 260)
-        c.circle(sx, sy, rng.pick([2, 2, 3]), rng.pick([GOLD, FLAME_O, CREAM]))
-
-    # --- speed lines
-    for _ in range(26):
-        x0 = rng.range(40, 980)
-        y0 = rng.range(120, 880)
-        ln = rng.range(60, 190)
-        c.line(x0, y0, x0 - ln, y0 + ln // 4, WHITE, thick=3)
-
-    # --- tortoise, tilted: shell dome, head, helmet, legs
-    # shell (big dome)
-    c.ellipse(540, 520, 250, 185, SHELL_D)
-    c.ellipse(540, 510, 238, 172, SHELL)
-    # shell plates
-    c.ellipse(470, 470, 62, 48, SHELL_L)
-    c.ellipse(600, 450, 58, 44, SHELL_L)
-    c.ellipse(540, 560, 66, 46, SHELL_L)
-    c.ellipse(660, 540, 52, 40, SHELL_L)
-    c.ellipse(440, 560, 50, 38, SHELL_L)
-    # shell rim highlight
-    c.ring(540, 515, 226, 238, SHELL_L)
-
-    # head, stretched forward and up
-    c.ellipse(760, 400, 92, 66, SKIN)
-    c.ellipse(742, 392, 78, 54, (244, 205, 140))
-    # snout + smile
-    c.ellipse(828, 420, 34, 24, SKIN)
-    c.line(818, 436, 852, 428, BLACK, thick=4)
-    c.circle(838, 402, 5, BLACK)  # nostril
-    # big determined eye
-    c.circle(758, 372, 26, WHITE)
-    c.circle(766, 372, 13, BLACK)
-    c.circle(770, 368, 5, WHITE)
-    # raised eyebrow
-    c.line(728, 336, 782, 330, BLACK, thick=6)
-    # red helmet with goggles
-    c.ellipse(736, 348, 96, 58, RED)
-    c.ellipse(736, 356, 96, 44, (232, 64, 60))
-    c.circle(736, 306, 14, GOLD)  # helmet button
-    c.line(700, 372, 800, 366, (40, 40, 60), thick=10)  # goggle strap
-    c.circle(726, 370, 20, (140, 210, 235))  # goggle lens
-    c.circle(786, 366, 20, (140, 210, 235))
-    c.circle(726, 370, 12, (200, 235, 250))
-    c.circle(786, 366, 12, (200, 235, 250))
-    # helmet spike
-    c.poly([(700, 306), (736, 240), (772, 306)], GOLD)
-
-    # front leg reaching forward, back legs tucked
-    c.ellipse(700, 640, 58, 34, SKIN_D)
-    c.ellipse(716, 646, 44, 24, SKIN)
-    c.ellipse(430, 660, 52, 30, SKIN_D)
-    c.ellipse(420, 664, 38, 20, SKIN)
-    c.ellipse(560, 690, 56, 30, SKIN_D)
-    # tail
-    c.poly([(330, 560), (290, 540), (296, 580), (336, 586)], SKIN_D)
-
-    # cape! a tiny red cape fluttering behind the shell
-    c.poly([(340, 470), (210, 420), (180, 520), (300, 540)], (178, 32, 40))
-    c.poly([(340, 480), (230, 440), (210, 510), (300, 530)], RED)
-
-    # --- confetti
-    confetti_cols = [GOLD, (120, 220, 255), (255, 110, 180), (140, 255, 170), WHITE]
-    for _ in range(90):
-        x = rng.range(30, 990)
-        y = rng.range(60, 940)
-        col = rng.pick(confetti_cols)
-        if rng.next() % 2:
-            c.circle(x, y, rng.pick([3, 4, 5]), col)
-        else:
-            c.poly([(x, y), (x + 9, y + 3), (x + 5, y + 10), (x - 3, y + 6)], col)
-
-    # --- funny detail: shocked bird with a party hat, top-left
-    bx, by = 150, 150
-    c.ellipse(bx, by, 46, 40, (240, 244, 250))  # body
-    c.circle(bx + 30, by - 28, 26, (240, 244, 250))  # head
-    c.circle(bx + 38, by - 34, 9, WHITE)  # wide eye
-    c.circle(bx + 40, by - 34, 4, BLACK)
-    c.circle(bx + 18, by - 34, 9, WHITE)
-    c.circle(bx + 20, by - 34, 4, BLACK)
-    c.poly([(bx + 52, by - 22), (bx + 78, by - 18), (bx + 54, by - 8)], (255, 170, 40))  # open beak
-    c.poly([(bx + 8, by - 50), (bx + 30, by - 96), (bx + 48, by - 48)], (255, 80, 120))  # party hat
-    c.circle(bx + 30, by - 96, 7, GOLD)
-    c.line(bx - 20, by + 30, bx - 44, by + 52, (200, 120, 60), thick=5)  # wing
-    # bird's dropped popcorn
-    for i in range(6):
-        c.circle(bx + 30 + i * 12, by + 90 + i * 8, 5, CREAM)
-
-    # --- tiny snail on the hill with a GO flag, bottom-right
-    sx, sy = 880, 900
-    c.ellipse(sx, sy, 40, 30, SKIN)
-    c.circle(sx + 34, sy - 26, 22, (200, 90, 90))
-    c.ring(sx + 34, sy - 26, 8, 20, (240, 180, 120))
-    c.circle(sx + 52, sy - 44, 5, BLACK)
-    c.line(sx + 52, sy - 44, sx + 58, sy - 60, BLACK, thick=3)
-    c.line(sx + 46, sy - 44, sx + 44, sy - 60, BLACK, thick=3)
-    c.line(sx + 10, sy - 20, sx + 10, sy - 66, BLACK, thick=4)
-    c.poly([(sx + 10, sy - 66), (sx + 52, sy - 56), (sx + 10, sy - 46)], (60, 200, 90))
-
-
-# ---------------------------------------------------------------- png encode
-def chunk(typ, data):
-    out = struct.pack(">I", len(data)) + typ + data
-    out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-    return out
-
-
-def save_png(c, path):
-    raw = bytearray()
-    for y in range(c.h):
-        raw.append(0)  # filter: none
-        raw += c.px[y * c.w * 3:(y + 1) * c.w * 3]
-    ihdr = struct.pack(">IIBBBBB", c.w, c.h, 8, 2, 0, 0, 0)
-    data = b"\x89PNG\r\n\x1a\n"
-    data += chunk(b"IHDR", ihdr)
-    data += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    data += chunk(b"IEND", b"")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-
-
-def main():
-    c = Canvas(W, H)
-    draw(c)
-    save_png(c, OUT)
-    print("wrote", OUT, os.path.getsize(OUT), "bytes")
-
-
-if __name__ == "__main__":
-    main()
+import os, struct, zlib, math
+W=H=1024
+pix=[[(0,0,0) for _ in range(W)] for _ in range(H)]
+def setp(x,y,c):
+ x=int(x); y=int(y)
+ if 0<=x<W and 0<=y<H: pix[y][x]=tuple(max(0,min(255,int(v))) for v in c)
+def disc(cx,cy,rx,ry,c):
+ for y in range(max(0,int(cy-ry)),min(H,int(cy+ry+1))):
+  q=((y-cy)/ry)**2
+  if q<=1:
+   dx=rx*math.sqrt(1-q)
+   for x in range(max(0,int(cx-dx)),min(W,int(cx+dx+1))): setp(x,y,c)
+def poly(ps,c):
+ for y in range(max(0,int(min(p[1] for p in ps))),min(H,int(max(p[1] for p in ps)+1))):
+  xs=[]
+  for (x1,y1),(x2,y2) in zip(ps,ps[1:]+ps[:1]):
+   if (y1<=y<y2) or (y2<=y<y1): xs.append(x1+(y-y1)*(x2-x1)/(y2-y1))
+  xs.sort()
+  for a,b in zip(xs[::2],xs[1::2]):
+   for x in range(max(0,int(a)),min(W,int(b+1))): setp(x,y,c)
+def line(ps,c,w=3):
+ for (x1,y1),(x2,y2) in zip(ps,ps[1:]):
+  n=max(1,int(math.hypot(x2-x1,y2-y1)/2))
+  for i in range(n+1): disc(x1+(x2-x1)*i/n,y1+(y2-y1)*i/n,w,w,c)
+for y in range(H):
+ t=y/650 if y<650 else (y-650)/374; c=(int(30+70*t),int(48+45*t),int(105+35*t)) if y<650 else (7,70,90)
+ for x in range(W): setp(x,y,c)
+for r in range(180,5,-4): disc(220,570,r,r,(255,int(125+.35*(180-r)),int(45+.25*(180-r))))
+poly([(0,650),(1024,630),(1024,720),(0,720)],(17,91,104))
+poly([(180,700),(260,570),(400,430),(560,300),(760,170),(930,125),(1000,170),(940,250),(850,300),(790,390),(790,500),(850,600),(920,680),(1024,720),(1024,930),(160,930)],(8,122,153))
+poly([(250,690),(340,545),(520,395),(700,270),(855,215),(940,230),(865,290),(770,360),(700,475),(710,610),(790,700)],(22,172,190))
+poly([(335,585),(485,430),(665,320),(810,275),(875,290),(760,345),(670,450),(650,570),(700,655)],(77,214,206))
+poly([(535,455),(640,380),(760,340),(850,360),(770,410),(720,500),(730,610),(820,700),(610,680),(560,585)],(5,54,91))
+line([(175,700),(250,585),(390,465),(560,335),(735,220),(880,165),(965,180)],(220,250,226),18)
+line([(190,682),(300,560),(470,420),(650,300),(820,205),(940,185)],(245,255,236),6)
+for x,y,s in [(290,420,10),(350,350,7),(430,290,11),(520,230,8),(610,180,10),(700,140,7),(780,110,11)]: poly([(x,y-s),(x+3,y-3),(x+s,y),(x+3,y+3),(x,y+s),(x-3,y+3),(x-s,y),(x-3,y-3)],(255,240,130))
+# Fold the crest into a hooked lip, with long ribbons tracing its momentum.
+curl=[(930+90*math.cos(a),300+125*math.sin(a)) for a in [(-1.4+i*3.3/55) for i in range(56)]]
+line(curl,(8,122,153),49)
+line([(x-12,y-12) for x,y in curl],(83,220,206),29)
+line([(x-22,y-25) for x,y in curl],(239,255,231),12)
+for k in range(4):
+ line([(220+k*27,735),(360+k*22,650),(440+k*23,510),(600+k*20,370),(765+k*18,285)],(38+k*10,187+k*10,199+k*6),3)
+for i in range(24):
+ x=430+i*23; y=320-i*7-(i%4)*19
+ disc(x,y,3+i%4,5+i%3,(232,255,238))
+line([(650,802),(790,785),(900,730),(975,650)],(205,251,230),9)
+line([(660,819),(810,805),(945,750)],(78,219,214),5)
+poly([(355,745),(450,720),(660,735),(745,770),(650,790),(450,785)],(238,106,48)); line([(390,756),(690,765)],(255,211,80),8)
+disc(535,610,112,130,(101,67,42)); disc(535,600,94,112,(164,111,48))
+for a in range(0,360,60): line([(535,600),(535+70*math.cos(math.radians(a)),600+82*math.sin(math.radians(a)))],(101,67,42),5)
+disc(540,475,78,70,(183,128,55)); disc(585,485,52,42,(201,149,70)); disc(568,465,9,12,(18,20,20)); disc(615,470,9,12,(18,20,20)); line([(570,500),(600,512),(635,500)],(45,25,20),7)
+poly([(465,565),(390,525),(320,555),(410,600)],(183,126,52)); poly([(600,570),(690,515),(760,535),(680,600)],(183,126,52)); line([(485,695),(470,744)],(120,78,38),24); line([(590,700),(625,748)],(120,78,38),24)
+poly([(495,445),(535,430),(575,448),(545,480)],(210,34,42)); poly([(520,440),(430,390),(345,410),(430,455)],(225,40,45));
+poly([(0,850),(200,820),(390,850),(560,830),(760,860),(1024,830),(1024,1024),(0,1024)],(218,177,100))
+disc(125,875,35,25,(184,125,61)); disc(95,855,22,20,(198,143,70)); line([(86,846),(105,842)],(20,25,35),5); disc(90,844,9,7,(20,25,35)); disc(112,842,9,7,(20,25,35)); line([(80,900),(48,918)],(184,125,61),7)
+poly([(205,925),(215,900),(225,925),(250,915),(236,940),(248,960),(223,950),(205,970),(205,945),(180,952),(192,935)],(230,84,54))
+# Character finishing: ivory grin, focused brow, patterned shell, and wake.
+poly([(567,497),(599,507),(634,496),(624,515),(598,524),(579,514)],(42,29,27))
+poly([(575,500),(599,509),(627,500),(620,510),(598,515),(582,508)],(255,244,198))
+line([(554,447),(578,455)],(69,46,29),5); line([(604,452),(624,448)],(69,46,29),4)
+disc(565,461,3,4,(255,249,214)); disc(612,465,3,4,(255,249,214))
+poly([(507,571),(535,552),(565,574),(563,621),(535,641),(505,618)],(211,158,66))
+line([(507,571),(535,552),(565,574),(563,621),(535,641),(505,618),(507,571)],(105,68,33),4)
+line([(451,591),(459,556),(477,535)],(233,181,85),4)
+line([(336,554),(380,565)],(231,178,81),4); line([(688,551),(731,535)],(231,178,81),4)
+poly([(431,413),(352,373),(383,426),(340,442),(431,446)],(246,54,54))
+line([(353,772),(307,757),(278,730)],(238,255,234),8)
+for x,y,r in [(319,736,6),(289,711,5),(264,696,4),(748,773,7),(781,766,5)]: disc(x,y,r,r,(239,255,237))
+# Snail's spiral house, raised eyestalks and mirrored sunglasses.
+disc(124,873,27,26,(99,64,49)); disc(124,873,22,21,(241,175,88))
+spiral=[(124+(2+t*1.3)*math.cos(t),873+(2+t*1.3)*math.sin(t)) for t in [i*.12 for i in range(112)]]
+line(spiral,(128,77,49),2)
+line([(67,899),(108,899),(149,897)],(171,119,57),6)
+line([(88,855),(82,833)],(180,130,68),3); line([(104,852),(109,830)],(180,130,68),3)
+line([(74,834),(116,829)],(25,31,43),3); disc(82,833,10,7,(16,36,50)); disc(108,830,10,7,(16,36,50))
+line([(79,830),(84,828)],(139,229,225),2); line([(105,827),(110,825)],(139,229,225),2)
+line([(83,865),(95,869),(104,864)],(74,48,31),2)
+for x,y in [(198,936),(215,920),(226,942)]: disc(x,y,2,2,(255,183,103))
+def png_bytes():
+ raw=b''.join(b'\0'+bytes(v for p in row for v in p) for row in pix)
+ def ch(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+ return b'\x89PNG\r\n\x1a\n'+ch(b'IHDR',struct.pack('>IIBBBBB',W,H,8,2,0,0,0))+ch(b'IDAT',zlib.compress(raw,9))+ch(b'IEND',b'')
+out=os.environ.get('MAKEFUN_OUTPUT_DIR','/output'); os.makedirs(out,exist_ok=True)
+with open(os.path.join(out,'entry.png'),'wb') as f: f.write(png_bytes())
